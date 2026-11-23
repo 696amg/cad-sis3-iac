@@ -1,0 +1,28 @@
+# One-off helper: prints the real OIDC "sub" claim of this repo + environment.
+# Run it from Actions -> show-sub -> Run workflow. Delete it afterwards.
+name: show-sub
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  show:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Print the sub claim
+        run: |
+          python3 - <<'PY'
+          import os, json, base64, urllib.request
+          url = os.environ["ACTIONS_ID_TOKEN_REQUEST_URL"] + "&audience=sts.amazonaws.com"
+          req = urllib.request.Request(url, headers={"Authorization": "bearer " + os.environ["ACTIONS_ID_TOKEN_REQUEST_TOKEN"]})
+          token = json.load(urllib.request.urlopen(req))["value"]
+          payload = token.split(".")[1]
+          payload += "=" * (-len(payload) % 4)
+          claims = json.loads(base64.urlsafe_b64decode(payload))
+          print("sub =", claims["sub"])
+          print("aud =", claims["aud"])
+          PY

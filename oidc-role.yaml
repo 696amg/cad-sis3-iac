@@ -1,14 +1,17 @@
 AWSTemplateFormatVersion: "2010-09-09"
-Description: GitHub Actions OIDC provider (optional) and deploy role for Practice 7
+Description: Practice 7 - GitHub OIDC provider (optional), deploy role for GitHub Actions, CloudFormation service role
 Parameters:
   CreateProvider:
     Type: String
     Default: "true"
     AllowedValues: ["true", "false"]
-    Description: Set to false if the account already has the token.actions.githubusercontent.com provider
+    Description: Use false if this account already has the token.actions.githubusercontent.com provider
   SubClaim:
     Type: String
-    Description: "Full sub, e.g. repo:OWNER/REPO:environment:production (check with: gh api repos/OWNER/REPO/actions/oidc/customization/sub)"
+    Description: "Exact sub printed by the show-sub workflow, e.g. repo:OWNER/REPO:environment:production"
+  StackName:
+    Type: String
+    Description: Name of the SIS 3 stack that the pipeline deploys
 Conditions:
   MakeProvider: !Equals [!Ref CreateProvider, "true"]
 Resources:
@@ -18,6 +21,44 @@ Resources:
     Properties:
       Url: https://token.actions.githubusercontent.com
       ClientIdList: [sts.amazonaws.com]
+
+  # CloudFormation acts through this role, so the GitHub role itself stays small.
+  # PowerUserAccess + IAM role management is broad: acceptable for a course project, tighten it for real work.
+  CfnServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: gha-cfn-service-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: cloudformation.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/PowerUserAccess
+      Policies:
+        - PolicyName: iam-roles-for-stack
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - iam:CreateRole
+                  - iam:DeleteRole
+                  - iam:GetRole
+                  - iam:PassRole
+                  - iam:TagRole
+                  - iam:UntagRole
+                  - iam:UpdateAssumeRolePolicy
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:PutRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:GetRolePolicy
+                  - iam:ListRolePolicies
+                  - iam:ListAttachedRolePolicies
+                Resource: "*"
+
   DeployRole:
     Type: AWS::IAM::Role
     Properties:
@@ -34,7 +75,52 @@ Resources:
                 token.actions.githubusercontent.com:aud: sts.amazonaws.com
               StringLike:
                 token.actions.githubusercontent.com:sub: !Ref SubClaim
-      # Attach iam/permissions-policy.json as an inline policy or managed policy after filling placeholders
+      Policies:
+        - PolicyName: pipeline-deploy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                  - ecr:PutImage
+                  - ecr:BatchGetImage
+                  - ecr:DescribeImages
+                Resource: !Sub arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/*
+              - Effect: Allow
+                Action:
+                  - cloudformation:DescribeStacks
+                  - cloudformation:GetTemplateSummary
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:DeleteChangeSet
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:GetTemplate
+                Resource: !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${StackName}/*
+              - Effect: Allow
+                Action:
+                  - ecs:DescribeTaskDefinition
+                  - ec2:DescribeVpcs
+                  - ec2:DescribeSubnets
+                Resource: "*"
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt CfnServiceRole.Arn
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: cloudformation.amazonaws.com
 Outputs:
   DeployRoleArn:
     Value: !GetAtt DeployRole.Arn
+  CfnRoleArn:
+    Value: !GetAtt CfnServiceRole.Arn

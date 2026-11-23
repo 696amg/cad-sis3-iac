@@ -1,0 +1,83 @@
+name: deploy
+on:
+  push:
+    branches: [main]
+
+permissions:
+  id-token: write          # required for OIDC
+  contents: read
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production  # sub becomes ...:environment:production
+    steps:
+      - uses: actions/checkout@v4
+
+      # Tests first: a failing test never touches your AWS account
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Unit tests
+        run: |
+          pip install boto3
+          python -m unittest -v
+
+      - uses: aws-actions/configure-aws-credentials@v6   # pin to a SHA in real projects
+        with:
+          role-to-assume: ${{ vars.DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      # First run only: create the stack with ImageTag="" (0 tasks) so the ECR repo exists
+      - name: Ensure the stack exists
+        env:
+          STACK_NAME: ${{ vars.STACK_NAME }}
+          CFN_ROLE_ARN: ${{ vars.CFN_ROLE_ARN }}
+        run: |
+          if ! aws cloudformation describe-stacks --stack-name "$STACK_NAME" >/dev/null 2>&1; then
+            VPC=$(aws ec2 describe-vpcs --filters Name=isDefault,Values=true --query 'Vpcs[0].VpcId' --output text)
+            SUBNETS=$(aws ec2 describe-subnets --filters Name=vpc-id,Values="$VPC" --query 'Subnets[].SubnetId' --output text | tr '\t' ',')
+            aws cloudformation deploy --stack-name "$STACK_NAME" --template-file template.yaml \
+              --role-arn "$CFN_ROLE_ARN" --capabilities CAPABILITY_IAM --no-fail-on-empty-changeset \
+              --parameter-overrides VpcId="$VPC" SubnetIds="$SUBNETS" ImageTag=""
+          fi
+
+      - name: Build and push image tagged with the commit SHA
+        env:
+          STACK_NAME: ${{ vars.STACK_NAME }}
+        run: |
+          REPO=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+            --query "Stacks[0].Outputs[?OutputKey=='RepositoryUri'].OutputValue" --output text)
+          aws ecr get-login-password | docker login -u AWS --password-stdin "${REPO%%/*}"
+          # tags are IMMUTABLE: a re-run of the same commit must not push again
+          if aws ecr describe-images --repository-name "${REPO#*/}" --image-ids imageTag="$GITHUB_SHA" >/dev/null 2>&1; then
+            echo "Image $GITHUB_SHA is already in ECR, skipping push"
+          else
+            docker build --platform linux/amd64 -t "$REPO:$GITHUB_SHA" .
+            docker push "$REPO:$GITHUB_SHA"
+          fi
+
+      - name: Deploy the stack with the new image tag
+        env:
+          STACK_NAME: ${{ vars.STACK_NAME }}
+          CFN_ROLE_ARN: ${{ vars.CFN_ROLE_ARN }}
+        run: |
+          aws cloudformation deploy --stack-name "$STACK_NAME" --template-file template.yaml \
+            --role-arn "$CFN_ROLE_ARN" --capabilities CAPABILITY_IAM --no-fail-on-empty-changeset \
+            --parameter-overrides ImageTag="$GITHUB_SHA"
+
+      # Evidence for the report: the image tag of the latest task definition must equal the commit SHA
+      - name: Show deployed task definition image
+        env:
+          STACK_NAME: ${{ vars.STACK_NAME }}
+        run: |
+          TD=$(aws ecs describe-task-definition --task-definition "${STACK_NAME}-task" \
+                 --query 'taskDefinition.taskDefinitionArn' --output text)
+          echo "Task definition: $TD"
+          echo "Image:           $(aws ecs describe-task-definition --task-definition "$TD" \
+                 --query 'taskDefinition.containerDefinitions[0].image' --output text)"
+          echo "Commit SHA:      $GITHUB_SHA"
