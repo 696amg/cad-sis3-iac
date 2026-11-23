@@ -1,0 +1,40 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: GitHub Actions OIDC provider (optional) and deploy role for Practice 7
+Parameters:
+  CreateProvider:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Set to false if the account already has the token.actions.githubusercontent.com provider
+  SubClaim:
+    Type: String
+    Description: "Full sub, e.g. repo:OWNER/REPO:environment:production (check with: gh api repos/OWNER/REPO/actions/oidc/customization/sub)"
+Conditions:
+  MakeProvider: !Equals [!Ref CreateProvider, "true"]
+Resources:
+  GitHubProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: MakeProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList: [sts.amazonaws.com]
+  DeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: gha-deploy-production
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: sts:AssumeRoleWithWebIdentity
+            Principal:
+              Federated: !Sub arn:aws:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+              StringLike:
+                token.actions.githubusercontent.com:sub: !Ref SubClaim
+      # Attach iam/permissions-policy.json as an inline policy or managed policy after filling placeholders
+Outputs:
+  DeployRoleArn:
+    Value: !GetAtt DeployRole.Arn

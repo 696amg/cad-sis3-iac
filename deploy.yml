@@ -1,0 +1,48 @@
+name: deploy
+on:
+  push:
+    branches: [main]
+
+permissions:
+  id-token: write          # required for OIDC
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production  # sub becomes ...:environment:production
+    steps:
+      - uses: actions/checkout@v4
+
+      # Tests first: a failing test never touches your AWS account
+      - run: npm ci && npm test   # <-- replace with your SIS 3 app's test command (pytest, go test ./... etc.)
+
+      - uses: aws-actions/configure-aws-credentials@v6   # pin to a SHA in real projects
+        with:
+          role-to-assume: ${{ vars.DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Build and push image tagged with the commit SHA
+        run: |
+          REPO=${{ vars.ECR_REPO }}
+          aws ecr get-login-password | docker login -u AWS --password-stdin ${REPO%%/*}
+          docker build -t $REPO:$GITHUB_SHA .
+          docker push $REPO:$GITHUB_SHA
+
+      - name: Deploy the CloudFormation stack with the new image tag
+        run: |
+          aws cloudformation deploy \
+            --stack-name ${{ vars.STACK_NAME }} \
+            --template-file infra/app.yaml \
+            --parameter-overrides ImageTag=$GITHUB_SHA \
+            --capabilities CAPABILITY_IAM --no-fail-on-empty-changeset
+
+      # Evidence for the submission: task definition image must end with the commit SHA
+      - name: Show deployed task definition image
+        run: |
+          TD=$(aws ecs describe-services --cluster ${{ vars.ECS_CLUSTER }} --services ${{ vars.ECS_SERVICE }} \
+                 --query 'services[0].taskDefinition' --output text)
+          echo "Task definition: $TD"
+          aws ecs describe-task-definition --task-definition "$TD" \
+            --query 'taskDefinition.containerDefinitions[].image' --output text
+          echo "Commit SHA:      $GITHUB_SHA"
